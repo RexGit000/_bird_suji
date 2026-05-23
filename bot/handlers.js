@@ -3080,6 +3080,13 @@ async function runBroadcastCopy(telegram, adminId, fromChatId, messageId, target
   let sent = 0;
   let failed = 0;
   const now = new Date();
+  const activeClause = {
+    $or: [
+      { pendingSubscriptionMonths: { $gt: 0 } },
+      { trialEndsAt: { $gt: now } },
+      { subscriptionEndsAt: { $gt: now } },
+    ],
+  };
 
   while (true) {
     const q = { bannedAt: null };
@@ -3087,9 +3094,11 @@ async function runBroadcastCopy(telegram, adminId, fromChatId, messageId, target
       q.pendingSubscriptionMonths = { $lte: 0 };
       q.subscriptionEndsAt = { $ne: null, $lte: now };
       q.$or = [{ trialEndsAt: null }, { trialEndsAt: { $lte: now } }];
+    } else {
+      Object.assign(q, activeClause);
     }
     if (lastId) q._id = { $gt: lastId };
-    const users = await BotUser.find(q).sort({ _id: 1 }).limit(batchSize).lean();
+    const users = await BotUser.find(q, { userId: 1 }).sort({ _id: 1 }).limit(batchSize).lean();
     if (!users.length) break;
 
     lastId = users[users.length - 1]._id;
