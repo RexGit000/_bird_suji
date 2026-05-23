@@ -176,15 +176,25 @@ async function enqueueJobDmBlastFromBot(text, replyMarkup, key) {
 
 function parseTelegramMessageLink(text = '') {
   const s = (text || '').toString();
-  const m = s.match(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]+)\/(\d+)/i);
-  if (m?.[1] && m?.[2] && m[1].toLowerCase() !== 'c') {
-    return { kind: 'username', username: m[1], messageId: Number(m[2]) };
-  }
-  const m2 = s.match(/(?:https?:\/\/)?t\.me\/c\/(\d+)\/(\d+)/i);
+  const m2 = s.match(/(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d+)\/(\d+)/i);
   if (m2?.[1] && m2?.[2]) {
     return { kind: 'c', internalId: m2[1], messageId: Number(m2[2]) };
   }
+  const m = s.match(/(?:https?:\/\/)?(?:www\.)?t\.me\/(?:s\/)?([a-zA-Z0-9_]+)\/(\d+)/i);
+  if (m?.[1] && m?.[2] && m[1].toLowerCase() !== 'c') {
+    return { kind: 'username', username: m[1], messageId: Number(m[2]) };
+  }
   return null;
+}
+
+function scheduleDeleteMessage(ctx, delayMs = 20_000) {
+  const chatId = ctx?.chat?.id;
+  const messageId = ctx?.message?.message_id;
+  if (!chatId || !messageId) return;
+  const t = setTimeout(() => {
+    ctx.telegram.deleteMessage(chatId, messageId).catch(() => {});
+  }, Math.max(0, Number(delayMs) || 0));
+  if (t?.unref) t.unref();
 }
 
 async function tryFetchMessageFromLink(linkInfo) {
@@ -383,31 +393,50 @@ async function handleManualPasteLink(ctx) {
       return false;
     }
 
-    const res = await tryFetchMessageFromLink(linkInfo);
-    if (!res.ok || !res.payload) {
-      await ctx.reply(`Can't create preview for this link.\n\n${res.reason || 'Unknown reason.'}`, { disable_web_page_preview: true }).catch(() => {});
+    scheduleDeleteMessage(ctx, 20_000);
+
+    const processing = await ctx.reply('⏳ Processing…', {
+      disable_web_page_preview: true,
+      reply_to_message_id: ctx.message.message_id,
+    }).catch(() => null);
+
+    const TIMEOUT_MS = 90_000;
+    const timeout = new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ ok: false, reason: `Timeout while fetching message (${Math.floor(TIMEOUT_MS / 1000)}s).` }), TIMEOUT_MS);
+      if (t?.unref) t.unref();
+    });
+    const res = await Promise.race([tryFetchMessageFromLink(linkInfo), timeout]);
+
+    if (!res?.ok || !res.payload) {
+      const msg =
+        `<b>❌ Can't create preview</b>\n\n` +
+        `${escapeHtml(res?.reason || 'Unknown reason.')}`;
+      if (processing?.message_id) {
+        await ctx.telegram.editMessageText(ctx.chat.id, processing.message_id, null, msg, { parse_mode: 'HTML', disable_web_page_preview: true }).catch(() => {});
+      } else {
+        await ctx.reply(msg, { parse_mode: 'HTML', disable_web_page_preview: true }).catch(() => {});
+      }
       return true;
     }
 
     const previewPayload = await buildDumpPreviewPayload(ctx, res.payload);
     const out = buildCandidatePost(previewPayload);
     const key = putManualRepost(res.payload);
-    await ctx.reply(
-      `<b>Preview</b>\n\n${out.text}`,
-      {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '✅ Post to targets', callback_data: `manual_post_${key}` },
-              { text: '⛔ Cancel', callback_data: `manual_cancel_${key}` },
-            ],
-            ...(out.reply_markup?.inline_keyboard || []),
-          ],
-        },
-      }
-    ).catch(() => {});
+    const previewText = `<b>Preview</b>\n\n${out.text}`;
+    const reply_markup = {
+      inline_keyboard: [
+        [
+          { text: '✅ Post to targets', callback_data: `manual_post_${key}` },
+          { text: '⛔ Cancel', callback_data: `manual_cancel_${key}` },
+        ],
+        ...(out.reply_markup?.inline_keyboard || []),
+      ],
+    };
+    if (processing?.message_id) {
+      await ctx.telegram.editMessageText(ctx.chat.id, processing.message_id, null, previewText, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup }).catch(() => {});
+    } else {
+      await ctx.reply(previewText, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup }).catch(() => {});
+    }
     return true;
   } catch {
     return false;

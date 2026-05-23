@@ -1220,7 +1220,7 @@ async function processAiBatchOnce() {
 
     for (const doc of docs) {
       const id = doc._id.toString();
-      const keep = decisionMap.has(id) ? decisionMap.get(id) : false;
+      let keep = decisionMap.has(id) ? decisionMap.get(id) : false;
       let docError = null;
       const docDecidedBy = decidedByMap.get(id) || decidedBy;
 

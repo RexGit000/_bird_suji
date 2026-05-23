@@ -802,12 +802,12 @@ export async function syncListenerAndPreacherGroupsOnce() {
   if (membershipSyncRunning) return;
   membershipSyncRunning = true;
   try {
-    const accounts = await Account.find(
+    const cursor = Account.find(
       { role: { $in: ['listener', 'preacher'] }, session: { $nin: [null, ''] } },
       { _id: 1, session: 1, groups: 1, username: 1, number: 1 }
-    ).lean();
+    ).sort({ createdAt: 1 }).lean().cursor();
 
-    for (const acc of accounts || []) {
+    for await (const acc of cursor) {
       const label = acc.username || acc.number || acc._id?.toString?.() || 'account';
       const client = createClient(acc.session, acc._id);
       try {
@@ -855,12 +855,12 @@ export async function syncListenerAndPreacherGroupsOnce() {
 }
 
 export async function syncCopyGroupsOnce() {
-  const accounts = await Account.find(
+  const cursor = Account.find(
     { role: 'copier', session: { $nin: [null, ''] } },
     { _id: 1, session: 1, groups: 1, username: 1, number: 1 }
-  ).lean();
+  ).sort({ createdAt: 1 }).lean().cursor();
 
-  for (const acc of accounts || []) {
+  for await (const acc of cursor) {
     const label = acc.username || acc.number || acc._id?.toString?.() || 'account';
     const client = createClient(acc.session, acc._id);
     try {
@@ -971,70 +971,108 @@ export async function enforceUniqueListenerGroupsOnce() {
 export async function enforceUniqueWorkerGroupsOnce() {
   const maxLeaves = Math.max(1, Math.min(60, Number(process.env.WORKER_GROUP_DEDUPE_MAX_LEAVES || 20)));
   const { ids: approvedIds, links: approvedLinks } = await getApprovedGroupExemptions();
-  const accounts = await Account.find(
-    { role: { $in: ['listener', 'preacher'] }, session: { $nin: [null, ''] } },
-    { _id: 1, role: 1, createdAt: 1, session: 1, groups: 1, username: 1, number: 1 }
-  ).lean();
-
-  const byKey = new Map();
-  for (const acc of accounts) {
-    for (const g of acc.groups || []) {
-      const key = workerGroupKey(g);
-      if (!key) continue;
-      if (key.startsWith('link:')) {
-        const link = key.slice(5);
-        if (approvedLinks.has(link)) continue;
-      } else if (key.startsWith('id:')) {
-        const id = key.slice(3);
-        if (isApprovedIdMatch(id, approvedIds)) continue;
-      }
-      const list = byKey.get(key) || [];
-      list.push({ acc, g, key });
-      byKey.set(key, list);
-    }
-  }
+  const sliceSize = Math.max(2, Math.min(80, maxLeaves + 1));
+  const rows = await Account.aggregate([
+    { $match: { role: { $in: ['listener', 'preacher'] }, session: { $nin: [null, ''] } } },
+    { $unwind: '$groups' },
+    {
+      $project: {
+        accountId: '$_id',
+        role: 1,
+        createdAt: 1,
+        username: 1,
+        number: 1,
+        group: '$groups',
+        normLink: { $ifNull: ['$groups.normalizedLink', '$groups.link'] },
+        gid: '$groups.id',
+      },
+    },
+    {
+      $addFields: {
+        key: {
+          $cond: [
+            { $and: [{ $ne: ['$normLink', null] }, { $ne: ['$normLink', ''] }] },
+            { $concat: ['link:', '$normLink'] },
+            {
+              $cond: [
+                { $and: [{ $ne: ['$gid', null] }, { $ne: ['$gid', ''] }] },
+                { $concat: ['id:', '$gid'] },
+                null,
+              ],
+            },
+          ],
+        },
+        roleRank: { $cond: [{ $eq: ['$role', 'listener'] }, 0, 1] },
+      },
+    },
+    { $match: { key: { $ne: null } } },
+    { $sort: { key: 1, roleRank: 1, createdAt: 1, accountId: 1 } },
+    {
+      $group: {
+        _id: '$key',
+        count: { $sum: 1 },
+        accounts: {
+          $push: {
+            accountId: '$accountId',
+            role: '$role',
+            createdAt: '$createdAt',
+            username: '$username',
+            number: '$number',
+            group: '$group',
+          },
+        },
+      },
+    },
+    { $match: { count: { $gt: 1 } } },
+    { $project: { key: '$_id', count: 1, accounts: { $slice: ['$accounts', sliceSize] } } },
+  ]).allowDiskUse(true).exec().catch(() => []);
 
   const leaves = [];
-  for (const [key, list] of byKey.entries()) {
+  for (const r of rows || []) {
+    const key = (r?.key || '').toString();
+    if (!key) continue;
+    if (key.startsWith('link:')) {
+      const link = key.slice(5);
+      if (approvedLinks.has(link)) continue;
+    } else if (key.startsWith('id:')) {
+      const id = key.slice(3);
+      if (isApprovedIdMatch(id, approvedIds)) continue;
+    }
+
+    const list = Array.isArray(r.accounts) ? r.accounts : [];
     if (list.length <= 1) continue;
-    list.sort((a, b) => {
-      const ra = (a.acc.role || '').toString();
-      const rb = (b.acc.role || '').toString();
-      if (ra !== rb) {
-        if (ra === 'listener') return -1;
-        if (rb === 'listener') return 1;
-      }
-      const ta = a.acc.createdAt ? new Date(a.acc.createdAt).getTime() : 0;
-      const tb = b.acc.createdAt ? new Date(b.acc.createdAt).getTime() : 0;
-      if (ta !== tb) return ta - tb;
-      return a.acc._id.toString().localeCompare(b.acc._id.toString());
-    });
     const winner = list[0];
     for (let i = 1; i < list.length; i++) {
-      leaves.push({ winner, loser: list[i] });
+      leaves.push({ winner, loser: list[i], key });
+      if (leaves.length >= maxLeaves) break;
     }
+    if (leaves.length >= maxLeaves) break;
   }
 
   let did = 0;
   const seenLosers = new Set();
   for (const item of leaves) {
     if (did >= maxLeaves) break;
-    const loserAcc = item.loser.acc;
-    const loserId = loserAcc._id.toString();
-    const group = item.loser.g;
-    const groupKey = item.loser.key;
+    const loserId = item?.loser?.accountId?.toString?.() || '';
+    if (!loserId) continue;
+    const group = item?.loser?.group || null;
+    const groupKey = item?.key || workerGroupKey(group) || 'n/a';
     const perAccountKey = `${loserId}::${groupKey}`;
     if (seenLosers.has(perAccountKey)) continue;
     seenLosers.add(perAccountKey);
 
+    const loserAcc = await Account.findById(loserId, { session: 1, role: 1, username: 1, number: 1 }).lean().catch(() => null);
+    if (!loserAcc?.session) continue;
+
     const label = loserAcc.username || loserAcc.number || loserId;
-    const client = createClient(loserAcc.session, loserAcc._id);
+    const client = createClient(loserAcc.session, loserId);
     try {
       await client.connect();
-      const left = await leaveWorkerGroup(client, loserAcc._id, group);
+      const left = await leaveWorkerGroup(client, loserId, group);
       if (left) {
         did++;
-        console.log(`[WorkerDedupe] left role=${loserAcc.role} account=${label} groupKey=${groupKey} winner=${item.winner.acc._id.toString()}`);
+        const winnerId = item?.winner?.accountId?.toString?.() || 'n/a';
+        console.log(`[WorkerDedupe] left role=${loserAcc.role} account=${label} groupKey=${groupKey} winner=${winnerId}`);
         await sleep(1200 + Math.random() * 1200);
       }
     } catch (err) {
