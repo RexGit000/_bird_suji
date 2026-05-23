@@ -96,6 +96,7 @@ const botSettingsSchema = new mongoose.Schema(
     requiredGroupId: { type: String, default: null },
     requiredGroupInviteLink: { type: String, default: null },
     jobsTargetChatId: { type: String, default: null },
+    pausedPostingChatIds: { type: [String], default: [] },
     reviewDumpChatId: { type: String, default: null },
     inviterAccountId: { type: String, default: null },
     inviterAccountIds: { type: [String], default: [] },

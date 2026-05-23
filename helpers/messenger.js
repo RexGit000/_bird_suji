@@ -25,7 +25,7 @@ import { initGroups, getGroups, removeGroup, addGroup } from './groupRegistry.js
 const botTelegram = new Telegram(process.env.BOT_TOKEN);
 let _promptTemplate = null;
 let _logoBytes = null;
-let _jobTargetsCache = { loadedAt: 0, ids: [] };
+let _jobTargetsCache = { loadedAt: 0, ids: [], pausedKey: '' };
 let _jobDmStarted = false;
 let _jobDmRunning = false;
 
@@ -1234,57 +1234,62 @@ async function processAiBatchOnce() {
       }
 
       if (keep) {
-        if (!targets.length) {
-          docError = 'no_targets_configured';
-          console.log(`[AI] keep=true but no targets id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'}`);
-        } else {
-          const payload = {
-            message: doc.text,
-            senderName: doc.senderName,
-            senderUsername: doc.senderUsername,
-            senderId: doc.senderId,
-            groupId: doc.groupId || null,
-            groupLink: doc.groupLink,
-            messageLink: doc.messageLink,
-          };
+        const payload = {
+          message: doc.text,
+          senderName: doc.senderName,
+          senderUsername: doc.senderUsername,
+          senderId: doc.senderId,
+          groupId: doc.groupId || null,
+          groupLink: doc.groupLink,
+          messageLink: doc.messageLink,
+        };
 
-          if (settings.botPostingEnabled) {
-            const out = buildCandidatePost(payload);
-            let anySent = false;
-            let attempted = 0;
-            let lastSendErr = null;
-            for (const target of targets) {
-              attempted++;
-              const sent = await sendBotMessageWithRetry(target, out.text, out.reply_markup);
-              if (sent?.ok) {
-                anySent = true;
-              } else {
-                lastSendErr = sent?.error || lastSendErr;
-              }
-            }
-            listenerTrace('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-            //#region debug-point listener-missing-messages post.attempt
-            await dbg('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-            //#endregion debug-point listener-missing-messages post.attempt
-            if (!anySent) await QueuedPost.create(payload).catch(() => {});
-            if (anySent) {
-              const groupKey = doc.chatId || doc.groupId || '';
-              const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
-              await enqueueJobDmBlast(out.text, out.reply_markup, dmKey);
-            } else {
-              docError = `post_failed:${lastSendErr || 'unknown'}`;
-              console.log(
-                `[AI] keep=true post failed id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'} attempted=${attempted} targets=${targets.length} err=${lastSendErr || 'unknown'}`
-              );
-            }
+        if (!targets.length) {
+          const hasAny = await hasAnyJobTargetsConfigured(settings);
+          if (!hasAny) {
+            docError = 'no_targets_configured';
+            console.log(`[AI] keep=true but no targets id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'}`);
           } else {
-            listenerTrace('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-            //#region debug-point listener-missing-messages post.queued
-            await dbg('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-            //#endregion debug-point listener-missing-messages post.queued
+            docError = 'targets_paused';
             await QueuedPost.create(payload).catch(() => {});
-            console.log(`[AI] keep=true queued (posting disabled) id=${id}`);
+            console.log(`[AI] keep=true queued (targets paused) id=${id}`);
           }
+        } else if (settings.botPostingEnabled) {
+          const out = buildCandidatePost(payload);
+          let anySent = false;
+          let attempted = 0;
+          let lastSendErr = null;
+          for (const target of targets) {
+            attempted++;
+            const sent = await sendBotMessageWithRetry(target, out.text, out.reply_markup);
+            if (sent?.ok) {
+              anySent = true;
+            } else {
+              lastSendErr = sent?.error || lastSendErr;
+            }
+          }
+          listenerTrace('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+          //#region debug-point listener-missing-messages post.attempt
+          await dbg('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+          //#endregion debug-point listener-missing-messages post.attempt
+          if (!anySent) await QueuedPost.create(payload).catch(() => {});
+          if (anySent) {
+            const groupKey = doc.chatId || doc.groupId || '';
+            const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
+            await enqueueJobDmBlast(out.text, out.reply_markup, dmKey);
+          } else {
+            docError = `post_failed:${lastSendErr || 'unknown'}`;
+            console.log(
+              `[AI] keep=true post failed id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'} attempted=${attempted} targets=${targets.length} err=${lastSendErr || 'unknown'}`
+            );
+          }
+        } else {
+          listenerTrace('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+          //#region debug-point listener-missing-messages post.queued
+          await dbg('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+          //#endregion debug-point listener-missing-messages post.queued
+          await QueuedPost.create(payload).catch(() => {});
+          console.log(`[AI] keep=true queued (posting disabled) id=${id}`);
         }
       }
 
@@ -1327,19 +1332,31 @@ function startAiBatchProcessor() {
 
 async function getJobTargetChatIds() {
   const stale = !_jobTargetsCache.loadedAt || (Date.now() - _jobTargetsCache.loadedAt) > 60 * 1000;
-  if (!stale && Array.isArray(_jobTargetsCache.ids)) return _jobTargetsCache.ids;
-
   const settings = await getSettings();
+  const pausedKey = (settings?.pausedPostingChatIds || []).map(String).sort().join(',');
+  if (!stale && Array.isArray(_jobTargetsCache.ids) && _jobTargetsCache.pausedKey === pausedKey) return _jobTargetsCache.ids;
+
   const configured = settings?.jobsTargetChatId ? Number(settings.jobsTargetChatId) : null;
   if (configured && Number.isFinite(configured)) {
-    _jobTargetsCache = { loadedAt: Date.now(), ids: [configured] };
+    const paused = new Set((settings?.pausedPostingChatIds || []).map(String));
+    const ids = paused.has(configured.toString()) ? [] : [configured];
+    _jobTargetsCache = { loadedAt: Date.now(), ids, pausedKey };
     return _jobTargetsCache.ids;
   }
 
   const rows = await ApprovedChat.find({ type: { $ne: 'channel' } }, { chatId: 1 }).lean();
-  const ids = [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))];
-  _jobTargetsCache = { loadedAt: Date.now(), ids };
+  const paused = new Set((settings?.pausedPostingChatIds || []).map(String));
+  const ids = [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))]
+    .filter((n) => !paused.has(n.toString()));
+  _jobTargetsCache = { loadedAt: Date.now(), ids, pausedKey };
   return ids;
+}
+
+async function hasAnyJobTargetsConfigured(settings) {
+  const configured = settings?.jobsTargetChatId ? Number(settings.jobsTargetChatId) : null;
+  if (configured && Number.isFinite(configured)) return true;
+  const any = await ApprovedChat.exists({ type: { $ne: 'channel' } }).catch(() => null);
+  return !!any;
 }
 
 async function isBotManagedChat(entityId, storedGroupId) {

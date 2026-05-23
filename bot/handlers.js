@@ -454,7 +454,8 @@ async function handleManualPost(ctx, key) {
   const settings = await getSettings();
   const targets = await getJobTargetChatIdsForPosting();
   if (!targets.length) {
-    await ctx.answerCbQuery('No target chats configured');
+    const allTargets = await getAllJobTargetChatIdsForPosting();
+    await ctx.answerCbQuery(allTargets.length ? 'Target posting is paused' : 'No target chats configured');
     return;
   }
 
@@ -3218,12 +3219,14 @@ export async function handleSettingsMenu(ctx) {
   const [channels, groups] = await Promise.all([getMandatoryChannelIds(), getMandatoryGroupIds()]);
   const inviterIds = getSelectedInviterIds(s);
   const reviewDump = s?.reviewDumpChatId ? s.reviewDumpChatId.toString() : 'not set';
+  const pausedTargets = Array.isArray(s?.pausedPostingChatIds) ? s.pausedPostingChatIds.length : 0;
   const text =
     `⚙️ *Settings*\n\n` +
     `Mandatory channels (approved): ${channels.length}\n` +
     `Mandatory groups (approved): ${groups.length}\n` +
     `Inviter accounts selected: ${inviterIds.length}\n\n` +
     `Review dump chat: ${reviewDump}\n\n` +
+    `Paused posting targets: ${pausedTargets}\n\n` +
     `Bot posting: ${s.botPostingEnabled ? '✅ ON' : '⛔ OFF'}\n` +
     `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}\n` +
     `Auto-resume workers: ${s.autoResumeWorkers ? '✅ ON' : '⛔ OFF'}`;
@@ -3235,10 +3238,11 @@ export async function handleSettingsMenu(ctx) {
       [Markup.button.callback('Pick Review Dump Group', 'review_dump_menu')],
       [Markup.button.callback('Use This Chat As Dump', 'set_review_dump_here')],
       [Markup.button.callback('Clear Review Dump', 'clear_review_dump')],
+      [Markup.button.callback('Posting Targets', 'posting_targets_menu')],
       [Markup.button.callback(s.autoResumeWorkers ? 'Disable Auto-Resume' : 'Enable Auto-Resume', 'toggle_auto_resume')],
       [Markup.button.callback(s.botPostingEnabled ? 'Disable Posting' : 'Enable Posting', 'toggle_posting')],
       [Markup.button.callback(s.aiAlertsEnabled ? 'Disable AI Alerts' : 'Enable AI Alerts', 'toggle_ai_alerts')],
-      [Markup.button.callback('Flush Queue', 'flush_queue')],
+      [Markup.button.callback('Delete Queue', 'flush_queue')],
       [Markup.button.callback('« Back', 'back_to_main')],
     ]),
   });
@@ -3327,10 +3331,72 @@ export async function handlePickReviewDump(ctx, chatId) {
 
 async function getJobTargetChatIdsForPosting() {
   const s = await getSettings();
+  const paused = new Set((s?.pausedPostingChatIds || []).map(String));
+  const configured = s?.jobsTargetChatId ? Number(s.jobsTargetChatId) : null;
+  if (configured && Number.isFinite(configured)) return paused.has(configured.toString()) ? [] : [configured];
+  const rows = await ApprovedChat.find({ type: { $ne: 'channel' } }, { chatId: 1 }).lean().catch(() => []);
+  return [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))]
+    .filter((n) => !paused.has(n.toString()));
+}
+
+async function getAllJobTargetChatIdsForPosting() {
+  const s = await getSettings();
   const configured = s?.jobsTargetChatId ? Number(s.jobsTargetChatId) : null;
   if (configured && Number.isFinite(configured)) return [configured];
   const rows = await ApprovedChat.find({ type: { $ne: 'channel' } }, { chatId: 1 }).lean().catch(() => []);
   return [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))];
+}
+
+export async function handlePostingTargetsMenu(ctx, page = 0) {
+  if (!(await requireAdmin(ctx))) return;
+  const s = await getSettings();
+  const paused = new Set((s?.pausedPostingChatIds || []).map(String));
+  const targets = await getAllJobTargetChatIdsForPosting();
+  const PAGE_SIZE = 10;
+  const safePage = Math.max(0, Number.isFinite(page) ? page : 0);
+  const start = safePage * PAGE_SIZE;
+  const slice = targets.slice(start, start + PAGE_SIZE);
+
+  const text =
+    `🎯 *Posting Targets*\n\n` +
+    `Tap to pause/resume posting per target chat.\n` +
+    `Paused: ${paused.size}\n` +
+    `Total targets: ${targets.length}`;
+
+  const rows = slice.map((id) => {
+    const key = id.toString();
+    const isPaused = paused.has(key);
+    const mark = isPaused ? '⏸️' : '▶️';
+    return [Markup.button.callback(`${mark} ${key}`, `toggle_post_target_${key}`)];
+  });
+
+  const nav = [];
+  const maxPage = Math.max(0, Math.ceil(targets.length / PAGE_SIZE) - 1);
+  if (safePage > 0) nav.push(Markup.button.callback('« Prev', `posting_targets_page_${safePage - 1}`));
+  if (safePage < maxPage) nav.push(Markup.button.callback('Next »', `posting_targets_page_${safePage + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('« Back', 'settings_menu')]);
+
+  await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
+  await ctx.answerCbQuery();
+}
+
+export async function handleTogglePostingTarget(ctx, chatId) {
+  if (!(await requireAdmin(ctx))) return;
+  const id = (chatId || '').toString().trim();
+  if (!id) {
+    await ctx.answerCbQuery('Not found');
+    return handlePostingTargetsMenu(ctx, 0);
+  }
+  const s = await getSettings();
+  const set = new Set((s?.pausedPostingChatIds || []).map(String));
+  const isPaused = set.has(id);
+  if (isPaused) set.delete(id);
+  else set.add(id);
+  s.pausedPostingChatIds = [...set];
+  await s.save().catch(() => {});
+  await ctx.answerCbQuery(isPaused ? '▶️ Resumed' : '⏸️ Paused');
+  return handlePostingTargetsMenu(ctx, 0);
 }
 
 async function handleReviewDecision(ctx, queueId, decision) {
@@ -3387,7 +3453,8 @@ async function handleReviewDecision(ctx, queueId, decision) {
 
     if (!targets.length) {
       await AiQueueMessage.updateOne({ _id: doc._id, reviewDecision: 'approved' }, { $set: { reviewDecision: null } }).catch(() => {});
-      await ctx.answerCbQuery('No target chats configured');
+      const allTargets = await getAllJobTargetChatIdsForPosting();
+      await ctx.answerCbQuery(allTargets.length ? 'Target posting is paused' : 'No target chats configured');
       console.log(`[Review] approve.no_targets ${JSON.stringify(logCtx)}`);
       return;
     }
@@ -3570,24 +3637,15 @@ function formatCandidatePost(fields) {
   return `${fields.message}${suffix}`;
 }
 
-async function flushQueuedPosts(telegram, settings) {
-  const targets = (await getMandatoryGroupIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
-  if (!targets.length) return;
-  const posts = await QueuedPost.find({}).sort({ createdAt: 1 }).limit(200);
-  for (const p of posts) {
-    const text = formatCandidatePost(p);
-    for (const target of targets) {
-      await telegram.sendMessage(target, text, { disable_web_page_preview: true }).catch(() => {});
-    }
-    await QueuedPost.deleteOne({ _id: p._id });
-  }
+async function flushQueuedPosts() {
+  const res = await QueuedPost.deleteMany({}).catch(() => null);
+  return res?.deletedCount ?? 0;
 }
 
 export async function handleFlushQueue(ctx) {
   if (!(await requireAdmin(ctx))) return;
-  const s = await getSettings();
-  await flushQueuedPosts(ctx.telegram, s);
-  await ctx.answerCbQuery('✅ Flushed');
+  const deleted = await flushQueuedPosts();
+  await ctx.answerCbQuery(`🗑️ Deleted ${deleted}`);
   return handleSettingsMenu(ctx);
 }
 
@@ -4478,6 +4536,9 @@ export function setupHandlers(bot) {
   bot.action('toggle_ai_alerts', handleToggleAiAlerts);
   bot.action('toggle_auto_resume', handleToggleAutoResume);
   bot.action('flush_queue', handleFlushQueue);
+  bot.action('posting_targets_menu', (ctx) => handlePostingTargetsMenu(ctx, 0));
+  bot.action(/^posting_targets_page_(\d+)$/, (ctx) => handlePostingTargetsMenu(ctx, parseInt(ctx.match[1])));
+  bot.action(/^toggle_post_target_(-?\d+)$/, (ctx) => handleTogglePostingTarget(ctx, ctx.match[1]));
   bot.action('set_inviter_account', handleSetInviterAccount);
   bot.action(/^pick_inviter_(.+)$/, ctx => handlePickInviterAccount(ctx, ctx.match[1]));
   bot.action('clear_inviter_account', handleClearInviterAccount);
