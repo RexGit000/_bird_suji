@@ -3,7 +3,7 @@ import { NewMessage } from 'telegram/events/index.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { Telegram } from 'telegraf';
-import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage, PostDedupe, BotUser, JobDmBlast } from '../models/db.js';
+import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage, BotUser, JobDmBlast } from '../models/db.js';
 import {
   createClient,
   extractUsernameFromLink,
@@ -384,6 +384,28 @@ function scoreJobHeuristics(textRaw = '') {
   return { score, devScore, jobScore, negScore, matched: [...new Set(matched)] };
 }
 
+function hardBlockReason(textRaw = '') {
+  const t = (textRaw || '').toString().toLowerCase();
+  const hits = [];
+  const hit = (name, rx) => { if (rx.test(t)) hits.push(name); };
+  hit('hacking', /\b(hack(ing)?|h@ck|account takeover|credential|otp bypass|bypass 2fa|ss7)\b/i);
+  hit('ddos', /\b(ddos|dos attack)\b/i);
+  hit('malware', /\b(malware|ransomware|rat\b|spyware)\b/i);
+  hit('crypto_wash', /\b(crypto mixing|mixing\/washing|washing|mixer)\b/i);
+  hit('wallet_phrase', /\b(seed phrase|wallet phrase|phrase recovery|wallet recovery)\b/i);
+  hit('usdt_prepay', /\b(usdt|tether)\b/i);
+  hit('prepayment', /\b(prepay|prepayment|pay upfront|upfront payment)\b/i);
+  hit('scam_signals', /\b(no demo|no free|guaranteed|fund recovery|recover funds)\b/i);
+  hit('self_ad_services', /\b(our services|we offer|service(s)? available|hire (me|us)|available for (hire|work)|contact us|reach out|dm me|pm me|inbox me|telegram:|whatsapp|discord)\b/i);
+
+  const seekerSignals = /\b(we'?re hiring|we are hiring|hiring|recruit(ing|er|ment)?|looking for|seeking|need (a|an)?|vacancy|open(ing)?( position)?|role|position|job (opening|opportunity)?|apply|send (your )?(cv|resume))\b/i;
+  if (hits.includes('self_ad_services') && !seekerSignals.test(t)) {
+    return 'self_ad_services';
+  }
+  if (!hits.length) return null;
+  return hits.slice(0, 3).join('+');
+}
+
 async function maybeSendReviewDumpCandidate(doc) {
   try {
     const settings = await getSettings();
@@ -424,7 +446,7 @@ async function maybeSendReviewDumpCandidate(doc) {
     if (jobScore < minJob) return;
 
     const payload = {
-      message: existing.text,
+      message: truncateWords(existing.text, 60),
       senderName: existing.senderName,
       senderUsername: existing.senderUsername,
       senderId: existing.senderId,
@@ -533,10 +555,60 @@ async function callOpenRouterWithFailover({
   traceKind,
 }) {
   const keys = getOpenRouterApiKeys();
-  if (!keys.length) throw new Error('OPENROUTER_API_KEY_1 missing');
+  if (!keys.length) {
+    throw new Error('OPENROUTER_API_KEY_1 missing');
+  }
 
   const maxRetriesPerKey = 3;
   let lastErr = null;
+  const promptStr = (prompt ?? '').toString();
+
+  const pullContentText = (content) => {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      const parts = [];
+      for (const p of content) {
+        if (!p) continue;
+        const t = (p?.text ?? p?.content ?? '').toString();
+        if (t) parts.push(t);
+      }
+      if (parts.length) return parts.join('');
+    }
+    return '';
+  };
+
+  const collectCandidateOutputs = (data, bodyText) => {
+    const out = [];
+    const firstChoice = Array.isArray(data?.choices) ? data.choices[0] : null;
+    const msg = firstChoice?.message || null;
+
+    const content = pullContentText(msg?.content);
+    if (content) out.push(content);
+
+    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+    for (const tc of toolCalls) {
+      const args =
+        tc?.function?.arguments ??
+        tc?.function?.args ??
+        tc?.arguments ??
+        '';
+      const s = (args ?? '').toString();
+      if (s.trim()) out.push(s);
+    }
+
+    const fnArgs = msg?.function_call?.arguments ?? '';
+    if ((fnArgs ?? '').toString().trim()) out.push(fnArgs.toString());
+
+    const textField = firstChoice?.text;
+    if ((textField ?? '').toString().trim()) out.push(textField.toString());
+
+    const outText = data?.output_text ?? data?.output ?? data?.result ?? null;
+    if ((outText ?? '').toString().trim()) out.push(outText.toString());
+
+    if ((bodyText ?? '').toString().trim()) out.push(bodyText.toString());
+
+    return out;
+  };
 
   for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
     const key = keys[keyIndex];
@@ -546,12 +618,6 @@ async function callOpenRouterWithFailover({
       const timeoutMs = Math.max(6000, Math.min(3600000, Number(process.env.OPENROUTER_TIMEOUT_MS || 3000000)));
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        llmLog('request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
-        listenerTrace('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
-        //#region debug-point listener-missing-messages llm.request
-        await dbg('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
-        //#endregion debug-point listener-missing-messages llm.request
-
         const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
@@ -563,30 +629,41 @@ async function callOpenRouterWithFailover({
           signal: controller.signal,
         });
 
+        const bodyText = await res.text().catch(() => '');
+        const status = res.status;
+
         if (!res.ok) {
-          const status = res.status;
-          const body = await res.text().catch(() => '');
-          llmLog('error', { provider: 'openrouter', model, status, bodyPreview: truncateTraceText(body, 900), keyIndex, attempt, traceKind });
+          console.log(
+            `[OpenRouter] error trace=${traceKind} model=${model} status=${status} body=${truncateTraceText(bodyText, 2000)}`
+          );
           const err = new Error(`openrouter_http_${status}`);
           err.status = status;
           throw err;
         }
 
-        const data = await res.json();
-        const out = data?.choices?.[0]?.message?.content ?? '';
-        llmLog('response', { provider: 'openrouter', model, finish: data?.choices?.[0]?.finish_reason ?? null, contentPreview: truncateTraceText(out, 900), keyIndex, attempt, traceKind });
-        listenerTrace('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
-        //#region debug-point listener-missing-messages llm.response
-        await dbg('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
-        //#endregion debug-point listener-missing-messages llm.response
+        let data = null;
+        try {
+          data = JSON.parse(bodyText);
+        } catch {
+          data = null;
+        }
 
-        const parsed = parse(out);
+        const candidates = collectCandidateOutputs(data, bodyText);
+        const primary = candidates.find(s => (s ?? '').toString().trim()) || '';
+        const rawPreview = truncateTraceText(primary, 6000);
+        console.log(
+          `[OpenRouter] response trace=${traceKind} model=${model} ms=${Date.now() - startedAt} raw=${rawPreview}`
+        );
+
+        let parsed = null;
+        if (primary) parsed = parse(primary);
+        if (parsed == null && bodyText) parsed = parse(bodyText);
         if (parsed == null) throw new Error('openrouter_parse');
-        llmLog('parsed', { provider: 'openrouter', model, parsedRows: Array.isArray(parsed) ? parsed.length : undefined, parsed, keyIndex, attempt, traceKind });
-        listenerTrace('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
-        //#region debug-point listener-missing-messages llm.parsed
-        await dbg('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
-        //#endregion debug-point listener-missing-messages llm.parsed
+
+        const parsedStr = (() => { try { return JSON.stringify(parsed); } catch { return ''; } })();
+        console.log(
+          `[OpenRouter] parsed trace=${traceKind} model=${model} rows=${Array.isArray(parsed) ? parsed.length : 0} decisions=${truncateTraceText(parsedStr, 6000)}`
+        );
         return parsed;
       } catch (err) {
         lastErr = err;
@@ -596,7 +673,9 @@ async function callOpenRouterWithFailover({
         const keyBad = isOpenRouterKeyBadStatus(status);
         const retryable = !keyBad && (isOpenRouterRetryableStatus(status) || err?.name === 'AbortError' || err?.message === 'openrouter_parse');
 
-        llmLog('attempt_failed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, error: err?.message || 'openrouter_failed', status: status ?? null, keyBad, retryable });
+        console.log(
+          `[OpenRouter] failed trace=${traceKind} model=${model} keyIndex=${keyIndex} attempt=${attempt} status=${status ?? 'n/a'} keyBad=${keyBad} retryable=${retryable} error=${(err?.message || 'openrouter_failed').toString()}`
+        );
         if (keyBad) break;
         if (!retryable || attempt >= maxRetriesPerKey) break;
 
@@ -641,7 +720,7 @@ async function callOpenAI(prompt) {
 }
 
 async function callOpenRouter(prompt) {
-  const model = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
+  const model = 'openrouter/free';
   const out = await callOpenRouterWithFailover({
     prompt,
     model,
@@ -671,9 +750,24 @@ function parseBatchDecisions(raw = '') {
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    return null;
+    const s = jsonText.toString();
+    const rx = /"id"\s*:\s*"([^"]+)"[\s\S]*?"keep"\s*:\s*(true|false)|"keep"\s*:\s*(true|false)[\s\S]*?"id"\s*:\s*"([^"]+)"/gi;
+    const out = [];
+    const seen = new Set();
+    let m;
+    while ((m = rx.exec(s))) {
+      const id = (m[1] || m[4] || '').toString();
+      const keepRaw = (m[2] || m[3] || '').toString();
+      if (!id) continue;
+      if (!keepRaw) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, keep: keepRaw === 'true' });
+    }
+    return out.length ? out : null;
   }
   if (!Array.isArray(parsed)) return null;
+  if (parsed.length === 0) return [];
   const out = [];
   for (const item of parsed) {
     const id = item?.id?.toString?.() || null;
@@ -724,7 +818,7 @@ async function callOpenAIBatch(prompt) {
 }
 
 async function callOpenRouterBatch(prompt) {
-  const model = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
+  const model = 'openrouter/free';
   const out = await callOpenRouterWithFailover({
     prompt,
     model,
@@ -752,23 +846,16 @@ async function classifyHiringIntentBatch(items) {
     `You will classify a batch of messages.\n\n` +
     `Return ONLY valid JSON: an array of objects like {\"id\":\"...\",\"keep\":true|false}.\n` +
     `keep=true only if the message is asking to hire/recruit/find a developer/engineer for work (full-time, freelance, gig, contract, project, one-time task).\n` +
+    `Return EXACTLY one object per input item, and include every id exactly once. If unsure, keep=false.\n` +
     `Do NOT include any text outside the JSON array.\n\n` +
     `Rules & examples:\n` +
     `${rules}\n\n` +
     `Batch items (JSON):\n` +
     `${JSON.stringify(items)}\n`;
 
-  listenerTrace('ai.batch', {
-    items: items.map(i => ({ id: i.id, text: truncateTraceText(i.text, 240) })),
-    itemsCount: items.length,
-    promptChars: prompt.length,
-  });
+  listenerTrace('ai.batch', { itemsCount: items.length, promptChars: prompt.length });
   //#region debug-point listener-missing-messages ai.batch
-  await dbg('ai.batch', {
-    items: items.map(i => ({ id: i.id, text: truncateTraceText(i.text, 240) })),
-    itemsCount: items.length,
-    promptChars: prompt.length,
-  });
+  await dbg('ai.batch', { itemsCount: items.length, promptChars: prompt.length });
   //#endregion debug-point listener-missing-messages ai.batch
   try {
     const rows = await callOpenAIBatch(prompt);
@@ -777,13 +864,16 @@ async function classifyHiringIntentBatch(items) {
     return { decidedBy: 'openai', rows };
   } catch (e1) {
     llmLog('batch.provider_failed', { provider: 'openai', error: e1?.message || 'openai_failed' });
+    console.log(`[AI] openai_failed -> openrouter_fallback error=${(e1?.message || 'openai_failed').toString()}`);
     try {
       const rows = await callOpenRouterBatch(prompt);
       await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
       llmLog('batch.decided', { decidedBy: 'openrouter', rows: rows.length, kept: rows.filter(r => r.keep).length });
+      console.log(`[AI] openrouter_fallback_ok rows=${rows.length} kept=${rows.filter(r => r.keep).length}`);
       return { decidedBy: 'openrouter', rows };
     } catch (err) {
       llmLog('batch.provider_failed', { provider: 'openrouter', error: err?.message || 'openrouter_failed' });
+      console.log(`[AI] openrouter_fallback_failed error=${(err?.message || 'openrouter_failed').toString()}`);
       const updated = await BotSettings.findOneAndUpdate(
         { _id: settings._id },
         { $inc: { aiConsecutiveFails: 1 } },
@@ -851,7 +941,8 @@ function formatCandidatePost(fields) {
 function buildCandidateButtons(fields) {
   const rows = [];
 
-  const senderId = fields?.senderId ? fields.senderId.toString().trim() : '';
+  const senderIdRaw = fields?.senderId ? fields.senderId.toString().trim() : '';
+  const senderId = (senderIdRaw && /^\d+$/.test(senderIdRaw)) ? senderIdRaw : '';
   if (senderId) rows.push([{ text: '👤 Contact', url: `tg://user?id=${senderId}` }]);
 
   const uname = fields?.senderUsername ? fields.senderUsername.toString().trim().replace(/^@/, '') : '';
@@ -873,23 +964,62 @@ export function buildCandidatePost(fields) {
   return { text, reply_markup };
 }
 
+function stripTgUserIdButtons(reply_markup) {
+  const rows = reply_markup?.inline_keyboard;
+  if (!Array.isArray(rows)) return reply_markup;
+  let changed = false;
+  const nextRows = [];
+  for (const row of rows) {
+    if (!Array.isArray(row)) continue;
+    const nextRow = [];
+    for (const btn of row) {
+      const url = btn?.url ? btn.url.toString() : '';
+      if (url.startsWith('tg://user?id=')) {
+        changed = true;
+        continue;
+      }
+      nextRow.push(btn);
+    }
+    if (nextRow.length) nextRows.push(nextRow);
+  }
+  if (!changed) return reply_markup;
+  if (!nextRows.length) return null;
+  return { inline_keyboard: nextRows };
+}
+
 async function sendBotMessageWithRetry(chatId, text, reply_markup = null) {
   const max = 3;
+  let lastErr = null;
   for (let attempt = 1; attempt <= max; attempt++) {
     try {
-      await botTelegram.sendMessage(chatId, text, { disable_web_page_preview: true, parse_mode: 'HTML', reply_markup: reply_markup || undefined });
-      return true;
+      const msg = await botTelegram.sendMessage(chatId, text, { disable_web_page_preview: true, parse_mode: 'HTML', reply_markup: reply_markup || undefined });
+      return { ok: true, error: null, messageId: msg?.message_id ?? null, chatId: msg?.chat?.id ?? null };
     } catch (err) {
+      lastErr = err;
+      const rawMsg = (err?.description || err?.message || '').toString();
+      if (rawMsg.includes('BUTTON_USER_INVALID') && reply_markup) {
+        const stripped = stripTgUserIdButtons(reply_markup);
+        if (stripped !== reply_markup) {
+          try {
+            const msg = await botTelegram.sendMessage(chatId, text, { disable_web_page_preview: true, parse_mode: 'HTML', reply_markup: stripped || undefined });
+            return { ok: true, error: null, messageId: msg?.message_id ?? null, chatId: msg?.chat?.id ?? null };
+          } catch (err2) {
+            lastErr = err2;
+          }
+        }
+      }
       const retryAfter = err?.parameters?.retry_after;
       const waitSec = retryAfter ? Number(retryAfter) : null;
       if (waitSec && attempt < max) {
         await sleep(waitSec * 1000);
         continue;
       }
-      return false;
+      const msg = (lastErr?.description || lastErr?.message || 'send_failed').toString();
+      return { ok: false, error: msg.slice(0, 240), messageId: null, chatId: null };
     }
   }
-  return false;
+  const msg = (lastErr?.description || lastErr?.message || 'send_failed').toString();
+  return { ok: false, error: msg.slice(0, 240), messageId: null, chatId: null };
 }
 
 async function setClientOnline(client) {
@@ -906,6 +1036,14 @@ function truncateForAi(text, maxChars) {
   const s = (text || '').toString();
   if (!maxChars || s.length <= maxChars) return s;
   return s.slice(0, maxChars);
+}
+
+function truncateWords(text, maxWords = 60) {
+  const s = (text || '').toString().trim();
+  if (!s) return s;
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return s;
+  return `${words.slice(0, maxWords).join(' ')}…`;
 }
 
 async function enqueueAiMessage(doc) {
@@ -995,7 +1133,7 @@ async function maybeSendReviewDumpCandidateFromAiDoc(doc) {
     if (!claimed) return;
 
     const payload = {
-      message: claimed.text,
+      message: truncateWords(claimed.text, 60),
       senderName: claimed.senderName,
       senderUsername: claimed.senderUsername,
       senderId: claimed.senderId,
@@ -1045,6 +1183,7 @@ async function processAiBatchOnce() {
 
     const settings = await getSettings();
     const targets = await getJobTargetChatIds();
+    console.log(`[AI] batch claimed id=${batchId} docs=${docs.length} targets=${targets.length} postingEnabled=${settings?.botPostingEnabled ? 'yes' : 'no'}`);
     listenerTrace('queue.claimed', { batchId, docs: docs.length, targets: targets.length, botPostingEnabled: !!settings.botPostingEnabled });
     //#region debug-point listener-missing-messages queue.claimed
     await dbg('queue.claimed', { batchId, docs: docs.length, targets: targets.length, botPostingEnabled: !!settings.botPostingEnabled });
@@ -1054,21 +1193,51 @@ async function processAiBatchOnce() {
 
     const aiMaxChars = Math.max(200, Math.min(4000, Number(process.env.AI_BATCH_TEXT_CHARS || 1400)));
     const items = docs.map(d => ({ id: d._id.toString(), text: truncateForAi(d.text, aiMaxChars) }));
-    const { decidedBy, rows } = await classifyHiringIntentBatch(items);
-    const decisionMap = new Map(rows.map(r => [r.id, r.keep]));
+    const CHUNK_SIZE = 40;
+    const decisionMap = new Map();
+    const decidedByMap = new Map();
+    let lastDecidedBy = null;
+    let totalRows = 0;
+    let kept = 0;
+    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+      const chunk = items.slice(i, i + CHUNK_SIZE);
+      const { decidedBy, rows } = await classifyHiringIntentBatch(chunk);
+      lastDecidedBy = decidedBy;
+      totalRows += rows.length;
+      for (const r of rows) {
+        decisionMap.set(r.id, !!r.keep);
+        decidedByMap.set(r.id, decidedBy);
+        if (r.keep) kept++;
+      }
+    }
     const decidedAt = new Date();
-    const kept = rows.filter(r => r.keep).length;
-    listenerTrace('ai.decisions', { batchId, decidedBy, rows: rows.length, kept });
+    const decidedBy = lastDecidedBy || 'openrouter';
+    console.log(`[AI] batch decided id=${batchId} decidedBy=${decidedBy} kept=${kept}/${totalRows}`);
+    listenerTrace('ai.decisions', { batchId, decidedBy, rows: totalRows, kept });
     //#region debug-point listener-missing-messages ai.decisions
-    await dbg('ai.decisions', { batchId, decidedBy, rows: rows.length, kept });
+    await dbg('ai.decisions', { batchId, decidedBy, rows: totalRows, kept });
     //#endregion debug-point listener-missing-messages ai.decisions
 
     for (const doc of docs) {
       const id = doc._id.toString();
       const keep = decisionMap.has(id) ? decisionMap.get(id) : false;
+      let docError = null;
+      const docDecidedBy = decidedByMap.get(id) || decidedBy;
 
       if (keep) {
-        if (targets.length) {
+        const block = hardBlockReason(doc.text || '');
+        if (block) {
+          keep = false;
+          docError = `blocked:${block}`;
+          console.log(`[AI] keep=true blocked id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'} reason=${block}`);
+        }
+      }
+
+      if (keep) {
+        if (!targets.length) {
+          docError = 'no_targets_configured';
+          console.log(`[AI] keep=true but no targets id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'}`);
+        } else {
           const payload = {
             message: doc.text,
             senderName: doc.senderName,
@@ -1082,46 +1251,39 @@ async function processAiBatchOnce() {
           if (settings.botPostingEnabled) {
             const out = buildCandidatePost(payload);
             let anySent = false;
+            let attempted = 0;
+            let lastSendErr = null;
             for (const target of targets) {
-              const groupKey = doc.chatId || doc.groupId || '';
-              const txtKey = `txt:${groupKey}::${contentHash(doc.text)}::${target}`;
-              const insertedTxt = await PostDedupe.create({
-                key: txtKey,
-                sourceChatId: doc.chatId || null,
-                sourceMessageId: doc.messageId ?? null,
-                targetChatId: target.toString(),
-              }).then(() => true).catch(() => false);
-              if (!insertedTxt) continue;
-
-              const srcKey = `src:${doc.chatId || ''}::${doc.messageId ?? ''}::${target}`;
-              if (doc.chatId && doc.messageId != null) {
-                await PostDedupe.create({
-                  key: srcKey,
-                  sourceChatId: doc.chatId || null,
-                  sourceMessageId: doc.messageId ?? null,
-                  targetChatId: target.toString(),
-                }).catch(() => {});
-              }
-
+              attempted++;
               const sent = await sendBotMessageWithRetry(target, out.text, out.reply_markup);
-              if (sent) anySent = true;
+              if (sent?.ok) {
+                anySent = true;
+              } else {
+                lastSendErr = sent?.error || lastSendErr;
+              }
             }
-            listenerTrace('post.attempt', { batchId, decidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            listenerTrace('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#region debug-point listener-missing-messages post.attempt
-            await dbg('post.attempt', { batchId, decidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            await dbg('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#endregion debug-point listener-missing-messages post.attempt
             if (!anySent) await QueuedPost.create(payload).catch(() => {});
             if (anySent) {
               const groupKey = doc.chatId || doc.groupId || '';
               const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
               await enqueueJobDmBlast(out.text, out.reply_markup, dmKey);
+            } else {
+              docError = `post_failed:${lastSendErr || 'unknown'}`;
+              console.log(
+                `[AI] keep=true post failed id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'} attempted=${attempted} targets=${targets.length} err=${lastSendErr || 'unknown'}`
+              );
             }
           } else {
-            listenerTrace('post.queued', { batchId, decidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            listenerTrace('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#region debug-point listener-missing-messages post.queued
-            await dbg('post.queued', { batchId, decidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            await dbg('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#endregion debug-point listener-missing-messages post.queued
             await QueuedPost.create(payload).catch(() => {});
+            console.log(`[AI] keep=true queued (posting disabled) id=${id}`);
           }
         }
       }
@@ -1132,16 +1294,17 @@ async function processAiBatchOnce() {
           $set: {
             status: 'done',
             decision: keep,
-            decidedBy,
+            decidedBy: docDecidedBy,
             decidedAt,
             lockedAt: null,
-            error: null,
+            error: docError,
           },
         }
       ).catch(() => {});
     }
   } catch (err) {
     const msg = err?.message ? err.message.toString() : 'batch_failed';
+    console.log(`[AI] batch_failed id=${batchId || 'n/a'} error=${msg}`);
     if (batchId) {
       await AiQueueMessage.updateMany(
         { status: 'processing', batchId },

@@ -15,7 +15,7 @@ const accountSchema = new mongoose.Schema(
     username: String,
     userId: { type: String, default: null },
     session: { type: String, default: null },
-    role: { type: String, enum: ['listener', 'preacher', 'finder', 'inviter'], default: 'listener' },
+    role: { type: String, enum: ['listener', 'preacher', 'finder', 'inviter', 'copier'], default: 'listener' },
     groups: [{ id: String, name: String, link: String, normalizedLink: String }],
     groupsSyncedAt: { type: Date, default: null },
     groupsSyncError: { type: String, default: null },

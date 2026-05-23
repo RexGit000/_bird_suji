@@ -454,7 +454,7 @@ async function storeDiscoveredLinks(rawLinks, keyword, accountId) {
 async function claimNextGroupLink(role, accountId) {
   const now = new Date();
   return GroupLink.findOneAndUpdate(
-    { status: 'new' },
+    { status: 'new', ...(role === 'preacher' ? { sourceKeyword: { $ne: '__copy__' } } : {}) },
     {
       $set: { status: 'claimed', claimedByAccountId: accountId.toString(), claimedRole: role, claimedAt: now },
       $inc: { attempts: 1 },
@@ -851,6 +851,59 @@ export async function syncListenerAndPreacherGroupsOnce() {
     }
   } finally {
     membershipSyncRunning = false;
+  }
+}
+
+export async function syncCopyGroupsOnce() {
+  const accounts = await Account.find(
+    { role: 'copier', session: { $nin: [null, ''] } },
+    { _id: 1, session: 1, groups: 1, username: 1, number: 1 }
+  ).lean();
+
+  for (const acc of accounts || []) {
+    const label = acc.username || acc.number || acc._id?.toString?.() || 'account';
+    const client = createClient(acc.session, acc._id);
+    try {
+      await client.connect();
+      const refreshed = client.session.save();
+      if (refreshed && refreshed !== acc.session) {
+        await Account.updateOne({ _id: acc._id }, { session: refreshed }).catch(() => {});
+      }
+
+      const dialogs = await client.getDialogs({ limit: 600 }).catch(() => []);
+      const groups = buildGroupSnapshotFromDialogs(dialogs, acc.groups);
+      await Account.updateOne(
+        { _id: acc._id },
+        { $set: { groups, groupsSyncedAt: new Date(), groupsSyncError: null } }
+      ).catch(() => {});
+
+      const links = (groups || []).map(g => g?.normalizedLink || g?.link).filter(Boolean);
+      await storeDiscoveredLinks(links, '__copy__', acc._id).catch(() => {});
+    } catch (err) {
+      if (isAuthError(err)) {
+        await Account.updateOne(
+          { _id: acc._id },
+          { $set: { groupsSyncedAt: new Date(), groupsSyncError: 'auth_error' } }
+        ).catch(() => {});
+      } else if (isFloodError(err)) {
+        const secs = getFloodSeconds(err);
+        await Account.updateOne(
+          { _id: acc._id },
+          { $set: { groupsSyncedAt: new Date(), groupsSyncError: `flood_${secs}s` } }
+        ).catch(() => {});
+        await sleep(secs * 1000);
+      } else {
+        await Account.updateOne(
+          { _id: acc._id },
+          { $set: { groupsSyncedAt: new Date(), groupsSyncError: (err?.message || 'error').toString().slice(0, 180) } }
+        ).catch(() => {});
+      }
+      console.log(`[CopyGroups] ${label} sync error: ${err?.message || 'error'}`);
+    } finally {
+      try { await client.disconnect(); } catch {}
+    }
+
+    await sleep(1500 + Math.random() * 1500);
   }
 }
 

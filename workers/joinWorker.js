@@ -1,5 +1,5 @@
 import { Account, Admin, AiQueueMessage, ApprovedChat, BotSettings, GroupLink, InviteTicket, Keyword } from '../models/db.js';
-import { runGroupJoiner, enforceUniqueWorkerGroupsOnce, syncListenerAndPreacherGroupsOnce } from '../helpers/groupJoiner.js';
+import { runGroupJoiner, enforceUniqueWorkerGroupsOnce, syncListenerAndPreacherGroupsOnce, syncCopyGroupsOnce } from '../helpers/groupJoiner.js';
 import { createClient, sleep, isAuthError } from '../helpers/telegram.js';
 import { Telegram } from 'telegraf';
 
@@ -267,7 +267,7 @@ export async function startJoinWorker(accountId) {
 
   const acc = await Account.findById(accountId, 'role');
   if (!acc) return;
-  if (acc.role === 'inviter') {
+  if (acc.role === 'inviter' || acc.role === 'copier') {
     await Account.updateOne({ _id: accountId }, { isJoining: false });
     return;
   }
@@ -353,8 +353,10 @@ export function startPoller() {
   }, POLL_INTERVAL);
 
   syncListenerAndPreacherGroupsOnce().catch(() => {});
+  syncCopyGroupsOnce().catch(() => {});
   const g = setInterval(() => {
     syncListenerAndPreacherGroupsOnce().catch(() => {});
+    syncCopyGroupsOnce().catch(() => {});
   }, GROUP_SYNC_INTERVAL);
   if (g?.unref) g.unref();
 

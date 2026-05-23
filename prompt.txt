@@ -18,9 +18,11 @@ Return true if the message:
 
 Return false if the message:
 - Is a developer offering their own services ("I'm available for hire", "I do React work")
+- Is a person/agency advertising services for sale (service lists + “contact us/DM me”), rather than seeking to hire/recruit a developer
 - Is general tech discussion unrelated to finding someone
 - Is asking a technical question (how to fix a bug, explain a concept, etc.)
 - Is about something unrelated to hiring a developer entirely
+- Is spam, scams, illegal services, or shady "services for hire" not related to software development roles (e.g. hacking, DDoS, malware, "crypto mixing/washing", account takeover, bypassing 2FA, prepayment/USDT schemes)
 
 ---
 
@@ -79,6 +81,15 @@ true
 
 Message: "who here does web scraping work?"
 true
+
+Message: "Hire the best hacker for DDoS / malware / crypto washing / bypass 2FA, DM @someone"
+false
+
+Message: "Purchase USDT, prepayment required, long-term partner needed, DM @someone"
+false
+
+Message: "We build websites and mobile apps. Our services: React, Node, UI/UX. Contact us @someone"
+false
 
 --
 

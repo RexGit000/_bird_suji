@@ -515,7 +515,11 @@ async function resumeWorkersOnBoot() {
   for (const acc of accounts) {
     if (acc.role === "inviter") continue;
     if (acc.isJoining) await startJoinWorker(acc._id.toString()).catch(() => {});
-    if (acc.isMessaging) await startMessageWorker(acc._id.toString()).catch(() => {});
+    if (acc.role === "listener") {
+      await startMessageWorker(acc._id.toString()).catch(() => {});
+    } else if (acc.isMessaging) {
+      await startMessageWorker(acc._id.toString()).catch(() => {});
+    }
   }
 }
 

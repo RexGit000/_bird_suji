@@ -29,6 +29,7 @@ import { startMessageWorker, stopMessageWorker, isMessageWorkerRunning, isAnyMes
 import { SEED_KEYWORDS } from '../models/keywords.js';
 import { buildCandidatePost, contentHash } from '../helpers/messenger.js';
 import { createClient } from '../helpers/telegram.js';
+import { syncCopyGroupsOnce } from '../helpers/groupJoiner.js';
 
 export async function isAdmin(userId, username) {
   await ensureAdminCacheLoaded();
@@ -112,6 +113,24 @@ function shuffleCopy(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+function truncateWords(text, maxWords = 60) {
+  const s = (text || '').toString().trim();
+  if (!s) return s;
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return s;
+  return `${words.slice(0, maxWords).join(' ')}…`;
+}
+
+async function buildDumpPreviewPayload(ctx, payload) {
+  const settings = await getSettings();
+  const dumpChatId = settings?.reviewDumpChatId ? settings.reviewDumpChatId.toString() : null;
+  const chatId = ctx?.chat?.id?.toString?.() || null;
+  if (dumpChatId && chatId && dumpChatId === chatId) {
+    return { ...payload, message: truncateWords(payload?.message, 60) };
+  }
+  return payload;
 }
 
 function putManualRepost(payload) {
@@ -318,7 +337,8 @@ async function handleManualForwardRepost(ctx) {
       _dedupeMessageId: sourceMessageId,
     };
 
-    const out = buildCandidatePost(payload);
+    const previewPayload = await buildDumpPreviewPayload(ctx, payload);
+    const out = buildCandidatePost(previewPayload);
     const key = putManualRepost(payload);
     await ctx.reply(
       `<b>Preview</b>\n\n${out.text}`,
@@ -369,7 +389,8 @@ async function handleManualPasteLink(ctx) {
       return true;
     }
 
-    const out = buildCandidatePost(res.payload);
+    const previewPayload = await buildDumpPreviewPayload(ctx, res.payload);
+    const out = buildCandidatePost(previewPayload);
     const key = putManualRepost(res.payload);
     await ctx.reply(
       `<b>Preview</b>\n\n${out.text}`,
@@ -417,16 +438,6 @@ async function handleManualPost(ctx, key) {
   const out = buildCandidatePost(payload);
   let anySent = false;
   for (const target of targets) {
-    const groupKey = payload._dedupeChatId || payload.groupId || '';
-    const txtKey = `txt:${groupKey}::${contentHash(payload.message)}::${target}`;
-    const insertedTxt = await PostDedupe.create({
-      key: txtKey,
-      sourceChatId: payload._dedupeChatId || null,
-      sourceMessageId: payload._dedupeMessageId ?? null,
-      targetChatId: target.toString(),
-    }).then(() => true).catch(() => false);
-    if (!insertedTxt) continue;
-
     const sentOk = await ctx.telegram.sendMessage(target, out.text, {
       disable_web_page_preview: true,
       parse_mode: 'HTML',
@@ -437,7 +448,6 @@ async function handleManualPost(ctx, key) {
     });
 
     if (sentOk) anySent = true;
-    else await PostDedupe.deleteOne({ key: txtKey }).catch(() => {});
   }
 
   await ctx.answerCbQuery(anySent ? '✅ Posted' : 'Failed to post');
@@ -2557,6 +2567,7 @@ export async function handleAddAccount(ctx) {
   const cPreacher = map.preacher || 0;
   const cFinder = map.finder || 0;
   const cInviter = map.inviter || 0;
+  const cCopier = map.copier || 0;
   await replyOrEdit(
     ctx,
     '📱 *Add Account*\n\nSelect the account type:',
@@ -2566,6 +2577,7 @@ export async function handleAddAccount(ctx) {
         [Markup.button.callback(`👂 Listener (${cListener})`, 'pick_role_listener')],
         [Markup.button.callback(`📣 Preacher (${cPreacher})`, 'pick_role_preacher')],
         [Markup.button.callback(`🔎 Group Finder (${cFinder})`, 'pick_role_finder')],
+        [Markup.button.callback(`📋 Copy Groups (${cCopier})`, 'pick_role_copier')],
         [Markup.button.callback(`🧷 Inviter (${cInviter})`, 'pick_role_inviter')],
         [Markup.button.callback('« Cancel', 'back_to_main')],
       ]),
@@ -2770,6 +2782,9 @@ async function _saveNewAccount(ctx, phoneNumber, client) {
   await ctx.reply(lines.join('\n'), { ...mainMenu() }).catch(() => {});
   if (shouldAutoStartJoin) {
     await startJoinWorker(created._id.toString()).catch(() => {});
+  }
+  if (role === 'copier') {
+    syncCopyGroupsOnce().catch(() => {});
   }
 }
 
@@ -3364,16 +3379,6 @@ async function handleReviewDecision(ctx, queueId, decision) {
           }).then(() => true).catch(() => false);
           if (!insertedTxt) continue;
 
-          const srcKey = `src:${doc.chatId || ''}::${doc.messageId ?? ''}::${target}`;
-          if (doc.chatId && doc.messageId != null) {
-            await PostDedupe.create({
-              key: srcKey,
-              sourceChatId: doc.chatId || null,
-              sourceMessageId: doc.messageId ?? null,
-              targetChatId: target.toString(),
-            }).catch(() => {});
-          }
-
           const sentOk = await ctx.telegram.sendMessage(target, out.text, {
             disable_web_page_preview: true,
             parse_mode: 'HTML',
@@ -3385,10 +3390,18 @@ async function handleReviewDecision(ctx, queueId, decision) {
 
           if (sentOk) {
             anySent = true;
+            const srcKey = `src:${doc.chatId || ''}::${doc.messageId ?? ''}::${target}`;
+            if (doc.chatId && doc.messageId != null) {
+              await PostDedupe.create({
+                key: srcKey,
+                sourceChatId: doc.chatId || null,
+                sourceMessageId: doc.messageId ?? null,
+                targetChatId: target.toString(),
+              }).catch(() => {});
+            }
             console.log(`[Review] approve.sent ${JSON.stringify({ ...logCtx, target: target.toString() })}`);
           } else {
             await PostDedupe.deleteOne({ key: txtKey }).catch(() => {});
-            await PostDedupe.deleteOne({ key: srcKey }).catch(() => {});
           }
         }
 
@@ -4363,6 +4376,7 @@ export function setupHandlers(bot) {
   bot.action('pick_role_listener', (ctx) => handlePickAccountRole(ctx, 'listener'));
   bot.action('pick_role_preacher', (ctx) => handlePickAccountRole(ctx, 'preacher'));
   bot.action('pick_role_finder', (ctx) => handlePickAccountRole(ctx, 'finder'));
+  bot.action('pick_role_copier', (ctx) => handlePickAccountRole(ctx, 'copier'));
   bot.action('pick_role_inviter', (ctx) => handlePickAccountRole(ctx, 'inviter'));
   bot.action(/^acc_(.+)$/, ctx => handleAccountDetail(ctx, ctx.match[1]));
   bot.action(/^logout_(.+)$/, ctx => handleLogout(ctx, ctx.match[1]));
