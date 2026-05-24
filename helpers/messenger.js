@@ -1193,7 +1193,6 @@ async function processAiBatchOnce() {
     await releaseStuckAiBatches();
 
     const settings = await getSettings();
-    if (!settings?.botPostingEnabled) return;
 
     const batchSize = Math.max(1, Math.min(200, Number(process.env.AI_BATCH_SIZE || 60)));
     batchId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1252,8 +1251,7 @@ async function processAiBatchOnce() {
             console.log(`[AI] keep=true but no targets id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'}`);
           } else {
             docError = 'targets_paused';
-            await QueuedPost.create(payload).catch(() => {});
-            console.log(`[AI] keep=true queued (targets paused) id=${id}`);
+            console.log(`[AI] keep=true blocked_by_pause id=${id}`);
           }
         } else if (settings.botPostingEnabled) {
           const out = buildCandidatePost(payload);
@@ -1273,7 +1271,6 @@ async function processAiBatchOnce() {
           //#region debug-point listener-missing-messages post.attempt
           await dbg('post.attempt', { batchId, decidedBy: docDecidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
           //#endregion debug-point listener-missing-messages post.attempt
-          if (!anySent) await QueuedPost.create(payload).catch(() => {});
           if (anySent) {
             const groupKey = doc.chatId || doc.groupId || '';
             const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
@@ -1285,12 +1282,8 @@ async function processAiBatchOnce() {
             );
           }
         } else {
-          listenerTrace('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-          //#region debug-point listener-missing-messages post.queued
-          await dbg('post.queued', { batchId, decidedBy: docDecidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
-          //#endregion debug-point listener-missing-messages post.queued
-          await QueuedPost.create(payload).catch(() => {});
-          console.log(`[AI] keep=true queued (posting disabled) id=${id}`);
+          docError = 'ai_posting_disabled';
+          console.log(`[AI] keep=true blocked_by_ai_disabled id=${id}`);
         }
       }
 

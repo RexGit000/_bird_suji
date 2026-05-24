@@ -219,7 +219,7 @@ async function tryResolveForwardSourceFromTitleAndText(senderNameRaw, textRaw) {
     const client = createClient(acc.session, acc._id);
     try {
       await client.connect();
-      const dialogs = await client.getDialogs({ limit: 600 }).catch(() => []);
+      const dialogs = await client.getDialogs({ limit: 250 }).catch(() => []);
       const candidates = [];
       for (const d of dialogs || []) {
         const ent = d?.entity;
