@@ -1,25 +1,7 @@
-import v8 from 'node:v8';
-import { spawn } from 'node:child_process';
+import "dotenv/config";
 
-const desiredHeapMb = Math.max(512, Number(process.env.SUJINI_HEAP_MB || 2048));
-const heapLimitMb = Math.round(v8.getHeapStatistics().heap_size_limit / 1024 / 1024);
-if (!process.env.SUJINI_RESPAWNED && heapLimitMb + 64 < desiredHeapMb) {
-  const execArgv = process.execArgv.filter(a => !a.startsWith('--max-old-space-size='));
-  const args = [...execArgv, `--max-old-space-size=${desiredHeapMb}`, ...process.argv.slice(1)];
-  const child = spawn(process.execPath, args, {
-    stdio: 'inherit',
-    env: { ...process.env, SUJINI_RESPAWNED: '1' },
-  });
-  child.on('exit', (code) => process.exit(code ?? 0));
-  process.on('SIGINT', () => child.kill('SIGINT'));
-  process.on('SIGTERM', () => child.kill('SIGTERM'));
-  process.exit(0);
-}
-
-await import('dotenv/config');
-
-const { Telegraf } = await import('telegraf');
-const {
+import { Telegraf } from "telegraf";
+import {
   connectDB,
   Account,
   Admin,
@@ -30,12 +12,11 @@ const {
   BotUser,
   GroupLink,
   Payment,
-} = await import('./models/db.js');
-const { setupHandlers, seedOnStartup, startSchedulers } = await import('./bot/handlers.js');
-const { default: launchBot } = await import('./bot/launchBot.js');
-const { startJoinWorker } = await import('./workers/joinWorker.js');
-const { startMessageWorker } = await import('./workers/messageWorker.js');
-const { default: express } = await import('express');
+} from "./models/db.js";
+import { setupHandlers, seedOnStartup, startSchedulers } from "./bot/handlers.js";
+import launchBot from "./bot/launchBot.js";
+import { startHeuristicsProcessor } from "./helpers/messenger.js";
+import express from "express";
 
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -524,6 +505,7 @@ async function connectWithRetry() {
 }
 
 await connectWithRetry();
+startHeuristicsProcessor();
 
 async function resumeWorkersOnBoot() {
   return;

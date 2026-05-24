@@ -5,6 +5,36 @@ const messageFlags = new Map();
 const WORKER_INSTANCE_ID = `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
 const LEASE_MS = 60_000;
 const RENEW_MS = 20_000;
+let memoryGuardStarted = false;
+
+function heapUsedMb() {
+  try {
+    return Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  } catch {
+    return 0;
+  }
+}
+
+function startMemoryGuard() {
+  if (memoryGuardStarted) return;
+  memoryGuardStarted = true;
+  const t = setInterval(() => {
+    const used = heapUsedMb();
+    if (used < 210) return;
+    if (messageFlags.size <= 1) return;
+    const ids = Array.from(messageFlags.keys());
+    const stopId = ids[ids.length - 1];
+    const flag = messageFlags.get(stopId);
+    if (flag) flag.running = false;
+    messageFlags.delete(stopId);
+    Account.updateOne(
+      { _id: stopId },
+      { $set: { isMessaging: false, messagingLeaseUpdatedAt: new Date() }, $unset: { messagingLeaseId: 1, messagingLeaseExpiresAt: 1 } }
+    ).catch(() => {});
+    console.warn(`[MemoryGuard] heapUsedMb=${used} stopped MessageWorker account=${stopId}`);
+  }, 10_000);
+  if (t?.unref) t.unref();
+}
 
 async function claimMessagingLease(accountId) {
   const now = new Date();
@@ -60,6 +90,7 @@ export async function startMessageWorker(accountId) {
   const id = accountId.toString();
   if (messageFlags.get(id)?.running) return;
 
+  startMemoryGuard();
   const acc = await Account.findById(accountId, 'role');
   if (!acc) return;
   if (acc.role !== 'listener' && acc.role !== 'preacher') {
@@ -70,7 +101,7 @@ export async function startMessageWorker(accountId) {
   const leased = await claimMessagingLease(accountId);
   if (!leased) return;
 
-  const flag = { running: true };
+  const flag = { running: true, startedAt: Date.now() };
   messageFlags.set(id, flag);
   const renewTimer = setInterval(() => {
     renewMessagingLease(accountId).then((ok) => {

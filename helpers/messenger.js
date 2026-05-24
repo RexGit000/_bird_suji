@@ -1325,6 +1325,10 @@ function startAiBatchProcessor() {
   if (_aiBatcherTimer?.unref) _aiBatcherTimer.unref();
 }
 
+export function startHeuristicsProcessor() {
+  startAiBatchProcessor();
+}
+
 async function getJobTargetChatIds() {
   const stale = !_jobTargetsCache.loadedAt || (Date.now() - _jobTargetsCache.loadedAt) > 60 * 1000;
   const settings = await getSettings();
@@ -1546,12 +1550,13 @@ async function runListener(accountId, flag) {
     let groupPollRunning = false;
     const KEEPALIVE_MS = Math.max(20_000, Number(process.env.LISTENER_KEEPALIVE_MS || 60_000));
     const DIALOGS_WARM_MS = Math.max(20_000, Number(process.env.LISTENER_DIALOGS_WARM_MS || 60_000));
+    const DIALOGS_WARM_LIMIT = Math.max(30, Math.min(250, Number(process.env.LISTENER_DIALOGS_WARM_LIMIT || 250)));
     const RECONNECT_IDLE_MS = Math.max(2 * 60_000, Number(process.env.LISTENER_RECONNECT_IDLE_MS || 12 * 60_000));
     const BACKFILL_MS = 5 * 60_000;
-    const BACKFILL_CHATS = 600;
-    const BACKFILL_LIMIT = 200;
+    const BACKFILL_CHATS = Math.max(30, Math.min(220, Number(process.env.LISTENER_BACKFILL_CHATS || 220)));
+    const BACKFILL_LIMIT = Math.max(10, Math.min(80, Number(process.env.LISTENER_BACKFILL_LIMIT || 80)));
     const GROUP_POLL_MS = 5 * 60_000;
-    const GROUP_POLL_LIMIT = 200;
+    const GROUP_POLL_LIMIT = Math.max(10, Math.min(80, Number(process.env.LISTENER_GROUP_POLL_LIMIT || 80)));
     const GROUP_POLL_SLEEP_MS = 0;
 
     const markListenerConnected = async () => {
@@ -1828,7 +1833,7 @@ async function runListener(accountId, flag) {
           await setClientOnline(client);
           if (Date.now() - lastDialogsWarmAt >= DIALOGS_WARM_MS) {
             lastDialogsWarmAt = Date.now();
-            await client.getDialogs({ limit: 600 }).catch(() => {});
+            await client.getDialogs({ limit: DIALOGS_WARM_LIMIT }).catch(() => {});
           }
           if (!groupPollRunning && Date.now() - lastGroupPollAt >= GROUP_POLL_MS) {
             groupPollRunning = true;
@@ -1848,7 +1853,7 @@ async function runListener(accountId, flag) {
             await client.connect();
             await client.getMe();
             await client.invoke(new Api.updates.GetState()).catch(() => {});
-            await client.getDialogs({ limit: 600 }).catch(() => {});
+            await client.getDialogs({ limit: DIALOGS_WARM_LIMIT }).catch(() => {});
             await setClientOnline(client);
             await markListenerConnected();
             lastListenerEventAt = Date.now();
@@ -1866,7 +1871,7 @@ async function runListener(accountId, flag) {
               await client.connect();
               await client.getMe();
               await client.invoke(new Api.updates.GetState()).catch(() => {});
-              await client.getDialogs({ limit: 600 }).catch(() => {});
+              await client.getDialogs({ limit: DIALOGS_WARM_LIMIT }).catch(() => {});
               await setClientOnline(client);
               await markListenerConnected();
             } catch {}
