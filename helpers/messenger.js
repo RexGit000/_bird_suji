@@ -942,7 +942,13 @@ function buildCandidateButtons(fields) {
   const rows = [];
 
   const senderIdRaw = fields?.senderId ? fields.senderId.toString().trim() : '';
-  const senderId = (senderIdRaw && /^\d+$/.test(senderIdRaw)) ? senderIdRaw : '';
+  let senderId = '';
+  if (senderIdRaw && /^\d+$/.test(senderIdRaw)) {
+    try {
+      const bi = BigInt(senderIdRaw);
+      if (bi > 0n && bi <= 2147483647n) senderId = senderIdRaw;
+    } catch {}
+  }
   if (senderId) rows.push([{ text: '👤 Contact', url: `tg://user?id=${senderId}` }]);
 
   const uname = fields?.senderUsername ? fields.senderUsername.toString().trim().replace(/^@/, '') : '';
@@ -1176,12 +1182,14 @@ async function processAiBatchOnce() {
     startJobDmProcessor();
     await releaseStuckAiBatches();
 
+    const settings = await getSettings();
+    if (!settings?.botPostingEnabled) return;
+
     const batchSize = Math.max(1, Math.min(200, Number(process.env.AI_BATCH_SIZE || 60)));
     batchId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
     const docs = await claimAiBatch(batchSize, batchId);
     if (!docs.length) return;
 
-    const settings = await getSettings();
     const targets = await getJobTargetChatIds();
     console.log(`[AI] batch claimed id=${batchId} docs=${docs.length} targets=${targets.length} postingEnabled=${settings?.botPostingEnabled ? 'yes' : 'no'}`);
     listenerTrace('queue.claimed', { batchId, docs: docs.length, targets: targets.length, botPostingEnabled: !!settings.botPostingEnabled });
