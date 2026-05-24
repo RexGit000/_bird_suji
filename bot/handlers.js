@@ -3576,18 +3576,15 @@ export async function handleSettingsMenu(ctx) {
     `Review dump chat: ${reviewDump}\n\n` +
     `Paused posting targets: ${pausedTargets}\n\n` +
     `AI posting: ${s.botPostingEnabled ? '✅ ON' : '⛔ OFF'}\n` +
-    `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}\n` +
-    `Auto-resume workers: ${s.autoResumeWorkers ? '✅ ON' : '⛔ OFF'}`;
+    `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}`;
 
   await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('Set Inviter Accounts', 'set_inviter_account')],
       [Markup.button.callback('Pick Review Dump Group', 'review_dump_menu')],
-      [Markup.button.callback('Use This Chat As Dump', 'set_review_dump_here')],
       [Markup.button.callback('Clear Review Dump', 'clear_review_dump')],
       [Markup.button.callback('Posting Targets', 'posting_targets_menu')],
-      [Markup.button.callback(s.autoResumeWorkers ? 'Disable Auto-Resume' : 'Enable Auto-Resume', 'toggle_auto_resume')],
       [Markup.button.callback(s.botPostingEnabled ? 'Disable AI Posting' : 'Enable AI Posting', 'toggle_posting')],
       [Markup.button.callback(s.aiAlertsEnabled ? 'Disable AI Alerts' : 'Enable AI Alerts', 'toggle_ai_alerts')],
       [Markup.button.callback('Delete Queue', 'flush_queue')],
@@ -4989,9 +4986,6 @@ export async function handleMessage(ctx) {
     if (handledRaw) return;
     await ctx.reply("Can't create preview from this message. Send a Telegram message link or forward a message here.", { disable_web_page_preview: true }).catch(() => {});
     return;
-  } else {
-    const handled = await handleManualForwardRepost(ctx);
-    if (handled) return;
   }
 
   const session = getSession(ctx.from?.id);
@@ -5170,7 +5164,6 @@ export function setupHandlers(bot) {
   bot.action('settings_menu', handleSettingsMenu);
   bot.action('toggle_posting', handleTogglePosting);
   bot.action('toggle_ai_alerts', handleToggleAiAlerts);
-  bot.action('toggle_auto_resume', handleToggleAutoResume);
   bot.action('flush_queue', handleFlushQueue);
   bot.action('posting_targets_menu', (ctx) => handlePostingTargetsMenu(ctx, 0));
   bot.action(/^posting_targets_page_(\d+)$/, (ctx) => handlePostingTargetsMenu(ctx, parseInt(ctx.match[1])));
@@ -5178,7 +5171,6 @@ export function setupHandlers(bot) {
   bot.action('set_inviter_account', handleSetInviterAccount);
   bot.action(/^pick_inviter_(.+)$/, ctx => handlePickInviterAccount(ctx, ctx.match[1]));
   bot.action('clear_inviter_account', handleClearInviterAccount);
-  bot.action('set_review_dump_here', handleSetReviewDumpHere);
   bot.action('clear_review_dump', handleClearReviewDump);
   bot.action('review_dump_menu', (ctx) => handleReviewDumpMenu(ctx, 0));
   bot.action(/^review_dump_page_(\d+)$/, (ctx) => handleReviewDumpMenu(ctx, parseInt(ctx.match[1])));

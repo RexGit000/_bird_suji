@@ -1209,39 +1209,20 @@ async function processAiBatchOnce() {
 
     runHeuristicsParallelForAiBatch(docs).catch(() => {});
 
-    const aiMaxChars = Math.max(200, Math.min(4000, Number(process.env.AI_BATCH_TEXT_CHARS || 1400)));
-    const items = docs.map(d => ({ id: d._id.toString(), text: truncateForAi(d.text, aiMaxChars) }));
-    const CHUNK_SIZE = 40;
-    const decisionMap = new Map();
-    const decidedByMap = new Map();
-    let lastDecidedBy = null;
+    const minTotal = Math.max(1, Number(process.env.REVIEW_DUMP_MIN_SCORE || 7));
+    const minDev = Math.max(0, Number(process.env.REVIEW_DUMP_MIN_DEV_SCORE || 2));
+    const minJob = Math.max(0, Number(process.env.REVIEW_DUMP_MIN_JOB_SCORE || 2));
+    const decidedAt = new Date();
+    const decidedBy = 'heuristics';
     let totalRows = 0;
     let kept = 0;
-    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-      const chunk = items.slice(i, i + CHUNK_SIZE);
-      const { decidedBy, rows } = await classifyHiringIntentBatch(chunk);
-      lastDecidedBy = decidedBy;
-      totalRows += rows.length;
-      for (const r of rows) {
-        decisionMap.set(r.id, !!r.keep);
-        decidedByMap.set(r.id, decidedBy);
-        if (r.keep) kept++;
-      }
-    }
-    const decidedAt = new Date();
-    const decidedBy = lastDecidedBy || 'openrouter';
-    console.log(`[AI] batch decided id=${batchId} decidedBy=${decidedBy} kept=${kept}/${totalRows}`);
-    listenerTrace('ai.decisions', { batchId, decidedBy, rows: totalRows, kept });
-    //#region debug-point listener-missing-messages ai.decisions
-    await dbg('ai.decisions', { batchId, decidedBy, rows: totalRows, kept });
-    //#endregion debug-point listener-missing-messages ai.decisions
-
     for (const doc of docs) {
       const id = doc._id.toString();
-      let keep = decisionMap.has(id) ? decisionMap.get(id) : false;
+      let keep = false;
       let docError = null;
-      const docDecidedBy = decidedByMap.get(id) || decidedBy;
-
+      const { score, devScore, jobScore } = scoreJobHeuristics(doc.text || '');
+      totalRows++;
+      keep = score >= minTotal && devScore >= minDev && jobScore >= minJob;
       if (keep) {
         const block = hardBlockReason(doc.text || '');
         if (block) {
@@ -1250,6 +1231,8 @@ async function processAiBatchOnce() {
           console.log(`[AI] keep=true blocked id=${id} chatId=${doc.chatId || 'n/a'} msgId=${doc.messageId ?? 'n/a'} reason=${block}`);
         }
       }
+      if (keep) kept++;
+      const docDecidedBy = decidedBy;
 
       if (keep) {
         const payload = {
@@ -1325,6 +1308,7 @@ async function processAiBatchOnce() {
         }
       ).catch(() => {});
     }
+    console.log(`[AI] batch decided id=${batchId} decidedBy=${decidedBy} kept=${kept}/${totalRows}`);
   } catch (err) {
     const msg = err?.message ? err.message.toString() : 'batch_failed';
     console.log(`[AI] batch_failed id=${batchId || 'n/a'} error=${msg}`);
