@@ -199,7 +199,17 @@ async function processJobDmOnce() {
     if (!job?._id) return;
 
     const batchSize = 500;
-    const q = { bannedAt: null, mandatoryJoinedAt: { $ne: null } };
+    const now = new Date();
+    const q = {
+      bannedAt: null,
+      redBannedAt: null,
+      removedAt: null,
+      mandatoryJoinedAt: { $ne: null },
+      $and: [
+        { $or: [{ softBanUntil: null }, { softBanUntil: { $lte: now } }] },
+        { $or: [{ pendingSubscriptionMonths: { $gt: 0 } }, { trialEndsAt: { $gt: now } }, { subscriptionEndsAt: { $gt: now } }] },
+      ],
+    };
     let lastId = job.lastUserId || null;
     let sent = job.sent || 0;
     let failed = job.failed || 0;
